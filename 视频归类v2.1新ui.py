@@ -194,7 +194,7 @@ class DjiArchiveGui(ctk.CTk):
         self.btn_cancel.pack(fill=ctk.X, pady=(0, 6))
 
         self.btn_exit = ctk.CTkButton(
-            left, text="✕  退出", command=self.destroy,
+            left, text="✕  退出", command=self.on_close,
             height=42, corner_radius=10, hover=True,
             fg_color=("#D1D5DB", "#4B5563"), hover_color=("#9CA3AF", "#374151"),
             text_color=("#1D2129", "#FFFFFF"),
@@ -485,12 +485,13 @@ class DjiArchiveGui(ctk.CTk):
         files = []
 
         def _walk_error(error):
-            raise error
+            self.msg_queue.put(("log", f"⚠ 遍历目录时出错：{error}"))
 
         for root, dirs, filenames in os.walk(src_dir, onerror=_walk_error):
+            if self._cancel_event.is_set():
+                raise RuntimeError("cancelled")
             for d in dirs:
-                rel_dir = os.path.relpath(os.path.join(root, d), src_dir)
-                os.makedirs(os.path.join(dst_dir, rel_dir), exist_ok=True)
+                os.makedirs(os.path.join(dst_dir, os.path.relpath(os.path.join(root, d), src_dir)), exist_ok=True)
             for fn in filenames:
                 src = os.path.join(root, fn)
                 rel = os.path.relpath(src, src_dir)
@@ -660,7 +661,7 @@ class DjiArchiveGui(ctk.CTk):
                     self.msg_queue.put(("log", f"⚠ 已取消，停止延时摄影：{folder_name}"))
                     return total_files
                 except Exception as e:
-                    self.fail_count += 1
+                    self.fail_count += tl_file_count
                     self.msg_queue.put(("log", f"❌ 延时摄影 {folder_name} 复制失败：{e}"))
 
                 completed_units += 1
