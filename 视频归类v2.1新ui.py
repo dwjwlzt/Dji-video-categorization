@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 DJI Action5 Pro 视频归档工具 v2.1 (CustomTkinter UI)
-业务逻辑与 v2.0 完全一致，仅 UI 现代化重写（红色主题）
+业务逻辑基于 v2.0，并增加了异常恢复、完整性校验、进度修正和跨日期延时摄影处理。
 
 打包命令（在当前目录下执行）：
     pyinstaller --noconfirm --onefile --windowed ^
@@ -19,6 +19,9 @@ import threading
 import queue
 import sys
 import shutil
+import traceback
+from datetime import datetime
+from tkinter import messagebox
 import customtkinter as ctk
 
 ctk.set_appearance_mode("system")
@@ -78,11 +81,17 @@ class DjiArchiveGui(ctk.CTk):
         self.file_list = []
         self.copy_count = 0
         self.skip_count = 0
+        self.fail_count = 0
+        self.scanned_total = 0
         self.total_bytes = 0
         self.is_running = False
         self.msg_queue = queue.Queue()
+        self._task_lock = threading.Lock()
+        self._cancel_event = threading.Event()
+        self.worker = None
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.poll_msg()
 
     # ─────────────────────────────── UI 构建 ───────────────────────────────
@@ -312,23 +321,130 @@ class DjiArchiveGui(ctk.CTk):
         flist = []
         for src_dir in SOURCE_DIRS:
             if not os.path.isdir(src_dir):
+                self.msg_queue.put(("log", f"提示：源目录不存在，已跳过：{src_dir}"))
                 continue
-            for fname in os.listdir(src_dir):
-                if os.path.splitext(fname)[1].lower() not in VIDEO_EXTS:
-                    continue
-                m = PATTERN.match(fname)
-                if not m:
-                    continue
-                date_str = m.group(1)
-                seq_no = m.group(2)
-                yyyy = date_str[0:4]
-                mm = date_str[4:6]
-                dd = date_str[6:8]
-                dest_dir = os.path.join(TARGET_ROOT, yyyy, mm, dd)
-                src_f = os.path.join(src_dir, fname)
-                dest_f = os.path.join(dest_dir, fname)
-                flist.append((src_f, dest_f, dest_dir, fname, seq_no))
+            try:
+                with os.scandir(src_dir) as entries:
+                    for entry in entries:
+                        try:
+                            if not entry.is_file():
+                                continue
+                        except OSError:
+                            continue
+                        fname = entry.name
+                        if os.path.splitext(fname)[1].lower() not in VIDEO_EXTS:
+                            continue
+                        m = PATTERN.match(fname)
+                        if not m:
+                            continue
+                        date_str = m.group(1)
+                        seq_no = m.group(2)
+                        yyyy = date_str[0:4]
+                        mm = date_str[4:6]
+                        dd = date_str[6:8]
+                        dest_dir = os.path.join(TARGET_ROOT, yyyy, mm, dd)
+                        flist.append((
+                            entry.path,
+                            os.path.join(dest_dir, fname),
+                            dest_dir,
+                            fname,
+                            seq_no,
+                            date_str,
+                        ))
+            except OSError as e:
+                self.msg_queue.put(("log", f"❌ 无法读取源目录 {src_dir}：{e}"))
         return flist
+
+    def scan_timelapse_folders(self):
+        folders = []
+        for tl_root in TIMELAPSE_SOURCE_DIRS:
+            if not os.path.isdir(tl_root):
+                self.msg_queue.put(("log", f"提示：延时摄影目录不存在，已跳过：{tl_root}"))
+                continue
+            try:
+                with os.scandir(tl_root) as entries:
+                    for entry in entries:
+                        try:
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue
+                        except OSError:
+                            continue
+                        m = TL_FOLDER_PATTERN.match(entry.name)
+                        if not m:
+                            continue
+                        folders.append((
+                            entry.path,
+                            entry.name,
+                            m.group(1),
+                            self._count_files(entry.path),
+                        ))
+            except OSError as e:
+                self.msg_queue.put(("log", f"❌ 无法读取延时摄影目录 {tl_root}：{e}"))
+        return folders
+
+    @staticmethod
+    def _count_files(src_dir):
+        total = 0
+        try:
+            for _root, _dirs, filenames in os.walk(src_dir):
+                total += len(filenames)
+        except OSError:
+            pass
+        return total
+
+    @staticmethod
+    def _files_equal(src_path, dst_path):
+        try:
+            return os.path.isfile(dst_path) and os.path.getsize(src_path) == os.path.getsize(dst_path)
+        except OSError:
+            return False
+
+    def _get_timelapse_dates(self, src_dir):
+        dates = set()
+        try:
+            for root, _dirs, filenames in os.walk(src_dir):
+                for name in filenames:
+                    path = os.path.join(root, name)
+                    try:
+                        stamp = os.stat(path).st_mtime
+                        dt = datetime.fromtimestamp(stamp)
+                        if 2000 <= dt.year <= datetime.now().year + 1:
+                            dates.add(dt.strftime("%Y%m%d"))
+                    except (OSError, OverflowError, ValueError):
+                        continue
+        except OSError:
+            pass
+        return dates
+
+    def _resolve_timelapse_dest(self, seq_no, seq_to_destdirs, src_dir):
+        candidates = seq_to_destdirs.get(seq_no, {})
+        dates = self._get_timelapse_dates(src_dir)
+
+        if candidates:
+            matched = sorted(set(candidates) & dates)
+            if matched:
+                if len(matched) > 1:
+                    self.msg_queue.put(("log", f"⚠ 延时摄影日期存在多个匹配 {matched}，选用最早日期 {matched[0]}。"))
+                return candidates[matched[0]]
+
+            if dates:
+                chosen = sorted(dates)[0]
+                self.msg_queue.put(("log", f"⚠ 延时摄影文件日期 {chosen} 与视频序号日期 {sorted(candidates)} 不一致，按文件日期归档。"))
+                return os.path.join(TARGET_ROOT, chosen[:4], chosen[4:6], chosen[6:8])
+
+            if len(candidates) == 1:
+                return next(iter(candidates.values()))
+
+            self.msg_queue.put(("log", f"⚠ 延时摄影无法确定日期，候选日期为 {sorted(candidates)}，已跳过。"))
+            return None
+
+        if dates:
+            chosen = sorted(dates)[0]
+            self.msg_queue.put(("log", f"提示：未找到对应视频，按延时摄影文件时间归档到 {chosen}。"))
+            return os.path.join(TARGET_ROOT, chosen[:4], chosen[4:6], chosen[6:8])
+
+        self.msg_queue.put(("log", f"⚠ 无法确定延时摄影 {src_dir} 的归档日期，已跳过。"))
+        return None
 
     def copy_file_stream(self, src_path, dst_path):
         file_size = os.path.getsize(src_path)
@@ -339,7 +455,7 @@ class DjiArchiveGui(ctk.CTk):
         try:
             with open(src_path, "rb") as f_in, open(tmp_path, "wb") as f_out:
                 while True:
-                    if not self.is_running:
+                    if self._cancel_event.is_set():
                         raise RuntimeError("cancelled")
                     chunk = f_in.read(BLOCK_SIZE)
                     if not chunk:
@@ -367,141 +483,282 @@ class DjiArchiveGui(ctk.CTk):
     def _copy_tree_with_progress(self, src_dir, dst_dir, folder_name):
         os.makedirs(dst_dir, exist_ok=True)
         files = []
-        for root, dirs, filenames in os.walk(src_dir):
-            for fn in filenames:
-                rel = os.path.relpath(os.path.join(root, fn), src_dir)
-                files.append((os.path.join(root, fn), os.path.join(dst_dir, rel)))
+
+        def _walk_error(error):
+            raise error
+
+        for root, dirs, filenames in os.walk(src_dir, onerror=_walk_error):
             for d in dirs:
-                os.makedirs(os.path.join(dst_dir, os.path.relpath(os.path.join(root, d), src_dir)), exist_ok=True)
+                rel_dir = os.path.relpath(os.path.join(root, d), src_dir)
+                os.makedirs(os.path.join(dst_dir, rel_dir), exist_ok=True)
+            for fn in filenames:
+                src = os.path.join(root, fn)
+                rel = os.path.relpath(src, src_dir)
+                files.append((src, os.path.join(dst_dir, rel), rel))
+
         total = len(files)
-        for i, (s, d) in enumerate(files, 1):
-            if not self.is_running:
+        copied = 0
+        skipped = 0
+        bytes_copied = 0
+        failed = 0
+
+        for i, (src, dst, rel) in enumerate(files, 1):
+            if self._cancel_event.is_set():
                 raise RuntimeError("cancelled")
-            os.makedirs(os.path.dirname(d), exist_ok=True)
-            shutil.copy2(s, d)
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if self._files_equal(src, dst):
+                    skipped += 1
+                    self.msg_queue.put(("filebar_reset",))
+                else:
+                    self.msg_queue.put(("curfile", f"{folder_name}/{rel}"[:70]))
+                    self.msg_queue.put(("filebar_reset",))
+                    wrote = self.copy_file_stream(src, dst)
+                    try:
+                        shutil.copystat(src, dst)
+                    except OSError:
+                        pass
+                    copied += 1
+                    bytes_copied += wrote
+            except RuntimeError:
+                raise
+            except Exception as e:
+                failed += 1
+                self.msg_queue.put(("log", f"❌ 延时摄影文件失败：{rel} — {e}"))
+                self.msg_queue.put(("filebar_reset",))
+
             if i % 20 == 0 or i == total:
                 self.msg_queue.put(("log", f"  [{folder_name}] {i}/{total}"))
 
-    def task_thread(self):
-        self.is_running = True
-        self.msg_queue.put(("btn", "disabled", "normal", "disabled"))
+        return copied, skipped, bytes_copied, failed
+
+    def _run_archive(self):
         self.copy_count = 0
         self.skip_count = 0
+        self.fail_count = 0
+        self.scanned_total = 0
         self.total_bytes = 0
+        self.msg_queue.put(("curfile", "-"))
+        self.msg_queue.put(("filebar_reset",))
+        self.msg_queue.put(("totalbar", 1, 0, 0.0))
         self.msg_queue.put(("log", "开始扫描媒体文件..."))
-        self.file_list = self.scan_files()
-        total = len(self.file_list)
 
-        if total == 0:
-            self.msg_queue.put(("status", "未找到媒体文件"))
-            self.msg_queue.put(("log", "未找到符合 DJI 命名格式的媒体文件。"))
-            self.is_running = False
-            self.msg_queue.put(("btn", "normal", "disabled", "normal"))
-            return
+        video_list = self.scan_files()
+        tl_folders = self.scan_timelapse_folders()
+        total_files = len(video_list) + sum(item[3] for item in tl_folders)
+        total_units = len(video_list) + len(tl_folders)
+        self.scanned_total = total_files
 
-        self.msg_queue.put(("stat", total, self.copy_count, self.skip_count, self.total_bytes))
+        if total_units == 0:
+            self.msg_queue.put(("log", "未找到符合 DJI 命名格式的媒体文件或延时摄影文件夹。"))
+            return 0
+
+        if not os.path.isdir(TARGET_ROOT):
+            try:
+                os.makedirs(TARGET_ROOT, exist_ok=True)
+            except OSError as e:
+                raise RuntimeError(f"无法创建归档目录 {TARGET_ROOT}：{e}") from e
+
+        self.msg_queue.put(("stat", total_files, 0, 0, 0))
         self.msg_queue.put(("status", "归档进行中"))
-        self.msg_queue.put(("log", f"共发现 {total} 个媒体文件。"))
+        self.msg_queue.put(("totalbar", total_units, 0, 0.0))
+        self.msg_queue.put((
+            "log",
+            f"共发现视频 {len(video_list)} 个、延时摄影文件夹 {len(tl_folders)} 个、文件 {total_files} 个。",
+        ))
         self.msg_queue.put(("log", "===== 阶段1：开始复制视频文件 =====\n"))
-        seq_to_destdir = {}
 
-        for idx, (src_file, dest_file, dest_dir, filename, seq_no) in enumerate(self.file_list):
-            if not self.is_running:
-                self.msg_queue.put(("status", "已取消"))
+        seq_to_destdirs = {}
+        completed_units = 0
+
+        for src_file, dest_file, dest_dir, filename, seq_no, date_str in video_list:
+            if self._cancel_event.is_set():
                 self.msg_queue.put(("log", "\n⚠ 用户取消，停止处理。"))
-                break
+                return total_files
 
-            os.makedirs(dest_dir, exist_ok=True)
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+            except OSError as e:
+                self.fail_count += 1
+                self.msg_queue.put(("log", f"❌ 无法创建目标目录 {dest_dir}：{e}"))
+                completed_units += 1
+                self.msg_queue.put(("stat", total_files, self.copy_count, self.skip_count, self.total_bytes))
+                self.msg_queue.put(("totalbar", total_units, completed_units, completed_units / total_units * 100))
+                continue
+
+            seq_to_destdirs.setdefault(seq_no, {})[date_str] = dest_dir
             self.msg_queue.put(("curfile", filename[:70]))
-            total_pct = (idx + 1) / total * 100
-            self.msg_queue.put(("totalbar", total, idx + 1, total_pct))
+            self.msg_queue.put(("filebar_reset",))
 
-            if seq_no not in seq_to_destdir:
-                seq_to_destdir[seq_no] = dest_dir
-
-            if os.path.exists(dest_file):
+            if self._files_equal(src_file, dest_file):
                 self.skip_count += 1
-                self.msg_queue.put(("filebar_reset",))
                 self.msg_queue.put(("log", f"跳过：{filename}"))
             else:
+                if os.path.exists(dest_file):
+                    self.msg_queue.put(("log", f"目标文件大小不一致，重新复制：{filename}"))
                 try:
                     wrote = self.copy_file_stream(src_file, dest_file)
+                    try:
+                        shutil.copystat(src_file, dest_file)
+                    except OSError:
+                        pass
                     self.copy_count += 1
                     self.total_bytes += wrote
                     self.msg_queue.put(("log", f"复制：{filename}"))
                 except RuntimeError:
                     self.msg_queue.put(("log", f"⚠ 已取消，停止：{filename}"))
-                    break
+                    return total_files
                 except Exception as e:
-                    self.msg_queue.put(("log", f"❌ 失败：{filename} — {str(e)}"))
-            self.msg_queue.put(("stat", total, self.copy_count, self.skip_count, self.total_bytes))
+                    self.fail_count += 1
+                    self.msg_queue.put(("log", f"❌ 失败：{filename} — {e}"))
+                    self.msg_queue.put(("filebar_reset",))
 
-        if not self.is_running:
-            self._finish_task(total)
-            return
+            completed_units += 1
+            self.msg_queue.put(("stat", total_files, self.copy_count, self.skip_count, self.total_bytes))
+            self.msg_queue.put(("totalbar", total_units, completed_units, completed_units / total_units * 100))
+
+        if self._cancel_event.is_set():
+            return total_files
 
         self.msg_queue.put(("log", "\n===== 阶段2：开始处理延时摄影文件夹 ====="))
-        if len(seq_to_destdir) == 0:
-            self.msg_queue.put(("log", "本次无需要处理的延时摄影编号。"))
+        if not tl_folders:
+            self.msg_queue.put(("log", "本次未发现延时摄影文件夹。"))
         else:
-            found_tl = False
-            for tl_src_root in TIMELAPSE_SOURCE_DIRS:
-                if not os.path.isdir(tl_src_root):
+            for src_tl, folder_name, seq_tl, tl_file_count in tl_folders:
+                if self._cancel_event.is_set():
+                    self.msg_queue.put(("log", "\n⚠ 用户取消，停止处理延时摄影。"))
+                    return total_files
+
+                dest_dir = self._resolve_timelapse_dest(seq_tl, seq_to_destdirs, src_tl)
+                if dest_dir is None:
+                    self.fail_count += 1
+                    completed_units += 1
+                    self.msg_queue.put(("stat", total_files, self.copy_count, self.skip_count, self.total_bytes))
+                    self.msg_queue.put(("totalbar", total_units, completed_units, completed_units / total_units * 100))
                     continue
-                for entry in os.scandir(tl_src_root):
-                    if not entry.is_dir(follow_symlinks=False):
-                        continue
-                    folder_name = entry.name
-                    m = TL_FOLDER_PATTERN.match(folder_name)
-                    if not m:
-                        continue
-                    seq_tl = m.group(1)
-                    if seq_tl in seq_to_destdir:
-                        found_tl = True
-                        src_tl = entry.path
-                        dst_tl = os.path.join(seq_to_destdir[seq_tl], folder_name)
-                        if not os.path.exists(dst_tl):
-                            try:
-                                self._copy_tree_with_progress(src_tl, dst_tl, folder_name)
-                                self.msg_queue.put(("log", f"✅ 复制延时摄影文件夹：{folder_name}"))
-                            except RuntimeError:
-                                self.msg_queue.put(("log", f"⚠ 已取消，停止延时摄影：{folder_name}"))
-                                break
-                            except Exception as e:
-                                self.msg_queue.put(("log", f"❌ 延时摄影 {folder_name} 复制失败：{str(e)}"))
-                        else:
-                            self.msg_queue.put(("log", f"跳过延时摄影文件夹（已存在）：{folder_name}"))
-                if not self.is_running:
-                    break
-            if not found_tl:
-                self.msg_queue.put(("log", "未找到本次编号对应的延时摄影文件夹"))
 
-        self._finish_task(total)
+                dst_tl = os.path.join(dest_dir, folder_name)
+                self.msg_queue.put(("curfile", folder_name[:70]))
+                try:
+                    copied, skipped, bytes_copied, failed = self._copy_tree_with_progress(
+                        src_tl, dst_tl, folder_name
+                    )
+                    self.copy_count += copied
+                    self.skip_count += skipped
+                    self.total_bytes += bytes_copied
+                    self.fail_count += failed
+                    if failed:
+                        self.msg_queue.put((
+                            "log",
+                            f"⚠ 延时摄影完成但有失败：{folder_name}（复制 {copied}，跳过 {skipped}，失败 {failed}）",
+                        ))
+                    elif copied == 0 and skipped == tl_file_count:
+                        self.msg_queue.put(("log", f"跳过延时摄影文件夹（已完整）：{folder_name}"))
+                    else:
+                        self.msg_queue.put(("log", f"延时摄影完成：{folder_name}（复制 {copied}，跳过 {skipped}）"))
+                except RuntimeError:
+                    self.msg_queue.put(("log", f"⚠ 已取消，停止延时摄影：{folder_name}"))
+                    return total_files
+                except Exception as e:
+                    self.fail_count += 1
+                    self.msg_queue.put(("log", f"❌ 延时摄影 {folder_name} 复制失败：{e}"))
 
-    def _finish_task(self, total):
+                completed_units += 1
+                self.msg_queue.put(("stat", total_files, self.copy_count, self.skip_count, self.total_bytes))
+                self.msg_queue.put(("totalbar", total_units, completed_units, completed_units / total_units * 100))
+
+        return total_files
+
+    def task_thread(self):
+        total_files = 0
+        error = False
+        try:
+            total_files = self._run_archive()
+        except Exception as e:
+            error = True
+            total_files = self.scanned_total
+            self.fail_count += 1
+            self.msg_queue.put(("log", f"❌ 任务异常：{e}"))
+            self.msg_queue.put(("log", traceback.format_exc()))
+        finally:
+            self._finish_task(total_files, error=error)
+
+    def _finish_task(self, total, error=False):
+        cancelled = self._cancel_event.is_set()
+        if error:
+            status = "任务失败"
+        elif cancelled:
+            status = "已取消"
+        elif total == 0:
+            status = "未找到媒体文件"
+        elif self.fail_count > 0:
+            status = "完成（有失败）"
+        else:
+            status = "归档完成"
+
         size_text = self.format_bytes(self.total_bytes)
-        self.msg_queue.put(("status", "归档完成" if self.is_running else "已取消"))
+        self.msg_queue.put(("status", status))
         self.msg_queue.put(("curfile", "-"))
-        self.msg_queue.put(("log", "\n===== 归档全部完成 =====" if self.is_running else "\n===== 已取消 ====="))
-        self.msg_queue.put(("log", f"总扫描文件：{total}"))
+        self.msg_queue.put(("filebar_reset",))
+
+        if error:
+            self.msg_queue.put(("log", "\n===== 任务异常结束 ====="))
+        elif cancelled:
+            self.msg_queue.put(("log", "\n===== 已取消 ====="))
+        elif total == 0:
+            self.msg_queue.put(("log", "\n===== 未找到可归档文件 ====="))
+        else:
+            self.msg_queue.put(("log", "\n===== 归档全部完成 ====="))
+
+        self.msg_queue.put(("log", f"总文件：{total}"))
         self.msg_queue.put(("log", f"新复制文件：{self.copy_count}"))
-        self.msg_queue.put(("log", f"跳过已存在：{self.skip_count}"))
+        self.msg_queue.put(("log", f"跳过已存在/已完整：{self.skip_count}"))
+        self.msg_queue.put(("log", f"失败数量：{self.fail_count}"))
         self.msg_queue.put(("log", f"复制数据量：{size_text}"))
-        self.is_running = False
+
+        with self._task_lock:
+            self.is_running = False
         self.msg_queue.put(("btn", "normal", "disabled", "normal"))
 
     def start_task(self):
-        if self.is_running:
-            return
-        t = threading.Thread(target=self.task_thread, daemon=True)
-        t.start()
+        with self._task_lock:
+            if self.is_running:
+                return
+            self.is_running = True
+            self._cancel_event.clear()
+
+        self.msg_queue.put(("btn", "disabled", "normal", "disabled"))
+        try:
+            self.worker = threading.Thread(target=self.task_thread, daemon=True)
+            self.worker.start()
+        except Exception as e:
+            with self._task_lock:
+                self.is_running = False
+            self.msg_queue.put(("status", "启动失败"))
+            self.msg_queue.put(("log", f"❌ 无法启动任务：{e}"))
+            self.msg_queue.put(("btn", "normal", "disabled", "normal"))
 
     def cancel_task(self):
-        if not self.is_running:
-            return
-        self.is_running = False
+        with self._task_lock:
+            if not self.is_running:
+                return
+        self._cancel_event.set()
         self.msg_queue.put(("status", "正在取消..."))
-        self.msg_queue.put(("log", "收到取消请求，等待当前操作完成..."))
+        self.msg_queue.put(("log", "收到取消请求，等待当前文件复制完成..."))
+        self.msg_queue.put(("btn", "disabled", "disabled", "disabled"))
+
+    def on_close(self):
+        with self._task_lock:
+            running = self.is_running
+        if running:
+            if not messagebox.askyesno("确认退出", "归档任务正在运行，确定要取消并退出吗？"):
+                return
+            self._cancel_event.set()
+            self.msg_queue.put(("status", "正在取消..."))
+            self.msg_queue.put(("log", "收到退出请求，正在停止任务..."))
+            if self.worker is not None and self.worker.is_alive():
+                self.worker.join(timeout=3.0)
+        self.destroy()
 
 
 if __name__ == "__main__":
