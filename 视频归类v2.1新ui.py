@@ -376,26 +376,38 @@ class DjiArchiveGui(ctk.CTk):
                         m = TL_FOLDER_PATTERN.match(entry.name)
                         if not m:
                             continue
-                        file_count = self._count_files(entry.path)
-                        folders.append((entry.path, entry.name, m.group(1), file_count))
+                        file_infos, dates = self._collect_tl_file_infos(entry.path)
+                        folders.append((entry.path, entry.name, m.group(1), file_infos, dates))
                         dir_count += 1
                 if dir_count:
-                    for _path, fname, _seq, fcount in folders[-dir_count:]:
-                        self.msg_queue.put(("log", f"    → {fname}（{fcount} 个文件）"))
+                    for _path, fname, _seq, finfos, _d in folders[-dir_count:]:
+                        self.msg_queue.put(("log", f"    → {fname}（{len(finfos)} 个文件）"))
                 self.msg_queue.put(("log", f"    → 共找到 {dir_count} 个延时摄影文件夹"))
             except OSError as e:
                 self.msg_queue.put(("log", f"❌ 无法读取延时摄影目录 {tl_root}：{e}"))
         return folders
 
     @staticmethod
-    def _count_files(src_dir):
-        total = 0
+    def _collect_tl_file_infos(src_dir):
+        file_infos = []
+        dates = set()
+        current_year = time.localtime().tm_year
         try:
-            for _root, _dirs, filenames in os.walk(src_dir):
-                total += len(filenames)
+            for root, _dirs, filenames in os.walk(src_dir):
+                for name in filenames:
+                    path = os.path.join(root, name)
+                    try:
+                        stat = os.stat(path)
+                        rel = os.path.relpath(path, src_dir)
+                        file_infos.append((path, rel, stat.st_size))
+                        t = time.localtime(stat.st_mtime)
+                        if 2000 <= t.tm_year <= current_year + 1:
+                            dates.add(time.strftime("%Y%m%d", t))
+                    except (OSError, OverflowError, ValueError):
+                        continue
         except OSError:
             pass
-        return total
+        return file_infos, dates
 
     @staticmethod
     def _files_equal(src_path, dst_path):
@@ -408,27 +420,8 @@ class DjiArchiveGui(ctk.CTk):
         except OSError:
             return False
 
-    def _get_timelapse_dates(self, src_dir):
-        dates = set()
-        current_year = time.localtime().tm_year
-        try:
-            for root, _dirs, filenames in os.walk(src_dir):
-                for name in filenames:
-                    path = os.path.join(root, name)
-                    try:
-                        stamp = os.stat(path).st_mtime
-                        t = time.localtime(stamp)
-                        if 2000 <= t.tm_year <= current_year + 1:
-                            dates.add(time.strftime("%Y%m%d", t))
-                    except (OSError, OverflowError, ValueError):
-                        continue
-        except OSError:
-            pass
-        return dates
-
-    def _resolve_timelapse_dest(self, seq_no, seq_to_destdirs, src_dir):
+    def _resolve_timelapse_dest(self, seq_no, seq_to_destdirs, dates, src_dir):
         candidates = seq_to_destdirs.get(seq_no, {})
-        dates = self._get_timelapse_dates(src_dir)
 
         if candidates:
             matched = sorted(set(candidates) & dates)
@@ -491,32 +484,19 @@ class DjiArchiveGui(ctk.CTk):
                     pass
             raise
 
-    def _copy_tree_with_progress(self, src_dir, dst_dir, folder_name):
+    def _copy_tree_with_progress(self, file_infos, dst_dir, folder_name):
         os.makedirs(dst_dir, exist_ok=True)
-        files = []
 
-        def _walk_error(error):
-            self.msg_queue.put(("log", f"⚠ 遍历目录时出错：{error}"))
-
-        for root, dirs, filenames in os.walk(src_dir, onerror=_walk_error):
-            if self._cancel_event.is_set():
-                raise RuntimeError("cancelled")
-            for d in dirs:
-                os.makedirs(os.path.join(dst_dir, os.path.relpath(os.path.join(root, d), src_dir)), exist_ok=True)
-            for fn in filenames:
-                src = os.path.join(root, fn)
-                rel = os.path.relpath(src, src_dir)
-                files.append((src, os.path.join(dst_dir, rel), rel))
-
-        total = len(files)
+        total = len(file_infos)
         copied = 0
         skipped = 0
         bytes_copied = 0
         failed = 0
 
-        for i, (src, dst, rel) in enumerate(files, 1):
+        for i, (src, rel, _size) in enumerate(file_infos, 1):
             if self._cancel_event.is_set():
                 raise RuntimeError("cancelled")
+            dst = os.path.join(dst_dir, rel)
             try:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 if self._files_equal(src, dst):
@@ -597,12 +577,12 @@ class DjiArchiveGui(ctk.CTk):
             self.msg_queue.put(("log", "本次未发现延时摄影文件夹。"))
             return completed_units
 
-        for src_tl, folder_name, seq_tl, tl_file_count in tl_folders:
+        for src_tl, folder_name, seq_tl, file_infos, dates in tl_folders:
             if self._cancel_event.is_set():
                 self.msg_queue.put(("log", "\n⚠ 用户取消，停止处理延时摄影。"))
                 return completed_units
 
-            dest_dir = self._resolve_timelapse_dest(seq_tl, seq_to_destdirs, src_tl)
+            dest_dir = self._resolve_timelapse_dest(seq_tl, seq_to_destdirs, dates, src_tl)
             if dest_dir is None:
                 self.fail_count += 1
                 completed_units += 1
@@ -613,7 +593,7 @@ class DjiArchiveGui(ctk.CTk):
             self.msg_queue.put(("curfile", folder_name[:NAME_MAX_LEN]))
             try:
                 copied, skipped, bytes_copied, failed = self._copy_tree_with_progress(
-                    src_tl, dst_tl, folder_name
+                    file_infos, dst_tl, folder_name
                 )
                 self.copy_count += copied
                 self.skip_count += skipped
@@ -624,7 +604,7 @@ class DjiArchiveGui(ctk.CTk):
                         "log",
                         f"⚠ 延时摄影完成但有失败：{folder_name}（复制 {copied}，跳过 {skipped}，失败 {failed}）",
                     ))
-                elif copied == 0 and skipped == tl_file_count:
+                elif copied == 0 and skipped == len(file_infos):
                     self.msg_queue.put(("log", f"跳过延时摄影文件夹（已完整）：{folder_name}"))
                 else:
                     self.msg_queue.put(("log", f"延时摄影完成：{folder_name}（复制 {copied}，跳过 {skipped}）"))
@@ -632,7 +612,7 @@ class DjiArchiveGui(ctk.CTk):
                 self.msg_queue.put(("log", f"⚠ 已取消，停止延时摄影：{folder_name}"))
                 return completed_units
             except OSError as e:
-                self.fail_count += tl_file_count
+                self.fail_count += len(file_infos)
                 self.msg_queue.put(("log", f"❌ 延时摄影 {folder_name} 复制失败：{e}"))
 
             completed_units += 1
@@ -658,7 +638,7 @@ class DjiArchiveGui(ctk.CTk):
 
         video_list = self.scan_files()
         tl_folders = self.scan_timelapse_folders()
-        total_files = len(video_list) + sum(item[3] for item in tl_folders)
+        total_files = len(video_list) + sum(len(item[3]) for item in tl_folders)
         total_units = len(video_list) + len(tl_folders)
         self.scanned_total = total_files
 
