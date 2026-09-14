@@ -46,7 +46,7 @@ TIMELAPSE_SOURCE_DIRS = [
 TARGET_ROOT = r"G:\Osmo action5 pro"
 PATTERN = re.compile(r"^DJI_(\d{8})\d{6}_(\d{4})_[A-Z]")
 TL_FOLDER_PATTERN = re.compile(r"^001_(\d{4})$")
-VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".lrf"}
 BLOCK_SIZE = 1024 * 1024 * 4
 NAME_MAX_LEN = 70
 
@@ -320,9 +320,11 @@ class DjiArchiveGui(ctk.CTk):
         flist = []
         for src_dir in SOURCE_DIRS:
             if not os.path.isdir(src_dir):
-                self.msg_queue.put(("log", f"提示：源目录不存在，已跳过：{src_dir}"))
+                self.msg_queue.put(("log", f"  跳过：源目录不存在 — {src_dir}"))
                 continue
+            self.msg_queue.put(("log", f"  扫描源目录：{src_dir}"))
             try:
+                dir_count = 0
                 with os.scandir(src_dir) as entries:
                     for entry in entries:
                         try:
@@ -349,6 +351,8 @@ class DjiArchiveGui(ctk.CTk):
                             seq_no,
                             date_str,
                         ))
+                        dir_count += 1
+                self.msg_queue.put(("log", f"    → 找到 {dir_count} 个视频文件"))
             except OSError as e:
                 self.msg_queue.put(("log", f"❌ 无法读取源目录 {src_dir}：{e}"))
         return flist
@@ -357,9 +361,11 @@ class DjiArchiveGui(ctk.CTk):
         folders = []
         for tl_root in TIMELAPSE_SOURCE_DIRS:
             if not os.path.isdir(tl_root):
-                self.msg_queue.put(("log", f"提示：延时摄影目录不存在，已跳过：{tl_root}"))
+                self.msg_queue.put(("log", f"  跳过：延时摄影目录不存在 — {tl_root}"))
                 continue
+            self.msg_queue.put(("log", f"  扫描延时摄影目录：{tl_root}"))
             try:
+                dir_count = 0
                 with os.scandir(tl_root) as entries:
                     for entry in entries:
                         try:
@@ -372,6 +378,11 @@ class DjiArchiveGui(ctk.CTk):
                             continue
                         file_count = self._count_files(entry.path)
                         folders.append((entry.path, entry.name, m.group(1), file_count))
+                        dir_count += 1
+                if dir_count:
+                    for _path, fname, _seq, fcount in folders[-dir_count:]:
+                        self.msg_queue.put(("log", f"    → {fname}（{fcount} 个文件）"))
+                self.msg_queue.put(("log", f"    → 共找到 {dir_count} 个延时摄影文件夹"))
             except OSError as e:
                 self.msg_queue.put(("log", f"❌ 无法读取延时摄影目录 {tl_root}：{e}"))
         return folders
