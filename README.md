@@ -72,7 +72,7 @@ DJI_20260914123000_0001_D.MP4
 
 ## 运行环境
 
-- **操作系统**：Windows 10 / 11（工具使用了 Win32 API 进行高 DPI 和窗口居中适配）
+- **操作系统**：Windows 10 / 11
 - **Python**：3.10 及以上
 - **依赖库**：
 
@@ -187,6 +187,16 @@ pyinstaller --noconfirm --onefile --windowed ^
 ## 更新日志
 
 版本号规则：每次提交（commit）递增 `0.0.1`，从 `2.1.0` 开始。
+
+### v2.1.10 — 精简代码 + 取消路径返回值 Bug 修复
+
+> commit `dc4ff91`
+
+- **删除 ctypes 手动 DPI 计算**：窗口居中从手动调用 Win32 API（`GetDeviceCaps` / `GetSystemMetrics`）改为 Tk 原生 `winfo_screenwidth/height`，删除约 10 行 ctypes 代码
+- **删除无意义的 `_task_lock`**：worker 线程从不直接读写 `is_running`，所有跨线程协调已通过 `queue.Queue` 保证线程安全，连带删除 5 处 `with self._task_lock:` 块
+- **删除 `scan_timelapse_folders` 二次遍历**：原来扫描完所有目录后再 `folders[-dir_count:]` 遍历一次打 log，改为就地打 log
+- **修复 `_copy_videos` 取消路径返回值不一致 Bug**：两个取消路径返回 `int`，正常路径返回 `(int, dict)` tuple，调用处解包会触发 `TypeError` 崩溃。统一改为返回 `(completed_units, {})`
+- 代码净减 15 行
 
 ### v2.1.9 — 延时摄影单遍扫描优化
 
