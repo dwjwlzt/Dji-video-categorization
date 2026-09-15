@@ -10,7 +10,6 @@ DJI Action5 Pro 视频归档工具 v2.1 (CustomTkinter UI)
       --add-data "dji.png;." ^
       "视频归类v2.1新ui.py"
 """
-import ctypes
 import os
 import queue
 import re
@@ -61,16 +60,10 @@ class DjiArchiveGui(ctk.CTk):
         super().__init__()
         self.title("DJI Action5 Pro 视频归档工具")
         win_w, win_h = 960, 720
-        hwnd_desk = ctypes.windll.user32.GetDesktopWindow()
-        hdc = ctypes.windll.user32.GetDC(hwnd_desk)
-        dpi_scale = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88) / 96.0
-        ctypes.windll.user32.ReleaseDC(hwnd_desk, hdc)
-        phys_ww = int(win_w * dpi_scale)
-        phys_wh = int(win_h * dpi_scale)
-        phys_sw = ctypes.windll.user32.GetSystemMetrics(0)
-        phys_sh = ctypes.windll.user32.GetSystemMetrics(1)
-        x = (phys_sw - phys_ww) // 2
-        y = (phys_sh - phys_wh) // 2
+        self.update_idletasks()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x = (sw - win_w) // 2
+        y = (sh - win_h) // 2
         self.geometry(f"{win_w}x{win_h}+{x}+{y}")
         self.minsize(win_w, win_h)
         try:
@@ -86,7 +79,6 @@ class DjiArchiveGui(ctk.CTk):
         self.total_bytes = 0
         self.is_running = False
         self.msg_queue = queue.Queue()
-        self._task_lock = threading.Lock()
         self._cancel_event = threading.Event()
         self.worker = None
 
@@ -379,9 +371,7 @@ class DjiArchiveGui(ctk.CTk):
                         file_infos, dates = self._collect_tl_file_infos(entry.path)
                         folders.append((entry.path, entry.name, m.group(1), file_infos, dates))
                         dir_count += 1
-                if dir_count:
-                    for _path, fname, _seq, finfos, _d in folders[-dir_count:]:
-                        self.msg_queue.put(("log", f"    → {fname}（{len(finfos)} 个文件）"))
+                        self.msg_queue.put(("log", f"    → {entry.name}（{len(file_infos)} 个文件）"))
                 self.msg_queue.put(("log", f"    → 共找到 {dir_count} 个延时摄影文件夹"))
             except OSError as e:
                 self.msg_queue.put(("log", f"❌ 无法读取延时摄影目录 {tl_root}：{e}"))
@@ -531,7 +521,7 @@ class DjiArchiveGui(ctk.CTk):
         for src_file, dest_file, dest_dir, filename, seq_no, date_str in video_list:
             if self._cancel_event.is_set():
                 self.msg_queue.put(("log", "\n⚠ 用户取消，停止处理。"))
-                return completed_units
+                return completed_units, {}
 
             try:
                 os.makedirs(dest_dir, exist_ok=True)
@@ -561,7 +551,7 @@ class DjiArchiveGui(ctk.CTk):
                     self.msg_queue.put(("log", f"复制：{filename}"))
                 except RuntimeError:
                     self.msg_queue.put(("log", f"⚠ 已取消，停止：{filename}"))
-                    return completed_units
+                    return completed_units, {}
                 except OSError as e:
                     self.fail_count += 1
                     self.msg_queue.put(("log", f"❌ 失败：{filename} — {e}"))
@@ -718,40 +708,35 @@ class DjiArchiveGui(ctk.CTk):
         self.msg_queue.put(("log", f"失败数量：{self.fail_count}"))
         self.msg_queue.put(("log", f"复制数据量：{size_text}"))
 
-        with self._task_lock:
-            self.is_running = False
+        self.is_running = False
         self.msg_queue.put(("btn", "normal", "disabled", "normal"))
 
     def start_task(self):
-        with self._task_lock:
-            if self.is_running:
-                return
-            self.is_running = True
-            self._cancel_event.clear()
+        if self.is_running:
+            return
+        self.is_running = True
+        self._cancel_event.clear()
 
         self.msg_queue.put(("btn", "disabled", "normal", "disabled"))
         try:
             self.worker = threading.Thread(target=self.task_thread, daemon=True)
             self.worker.start()
         except OSError as e:
-            with self._task_lock:
-                self.is_running = False
+            self.is_running = False
             self.msg_queue.put(("status", "启动失败"))
             self.msg_queue.put(("log", f"❌ 无法启动任务：{e}"))
             self.msg_queue.put(("btn", "normal", "disabled", "normal"))
 
     def cancel_task(self):
-        with self._task_lock:
-            if not self.is_running:
-                return
+        if not self.is_running:
+            return
         self._cancel_event.set()
         self.msg_queue.put(("status", "正在取消..."))
         self.msg_queue.put(("log", "收到取消请求，等待当前文件复制完成..."))
         self.msg_queue.put(("btn", "disabled", "disabled", "disabled"))
 
     def on_close(self):
-        with self._task_lock:
-            running = self.is_running
+        running = self.is_running
         if running:
             if not messagebox.askyesno("确认退出", "归档任务正在运行，确定要取消并退出吗？"):
                 return
