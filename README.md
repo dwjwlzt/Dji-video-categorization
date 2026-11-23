@@ -209,6 +209,8 @@ pyinstaller --noconfirm --onefile --windowed ^
 
 ### v2.1.11 — 支持照片归档
 
+> commit `1a8a6d0`
+
 - **修复照片漏归档**：`VIDEO_EXTS` 白名单只有视频扩展名，`DJI_*.JPG` / `DJI_*.DNG` 在扫描阶段就被丢掉。新增 `PHOTO_EXTS` 和 `MEDIA_EXTS` 两个集合，视频与照片共用同一套日期正则
 - 扫描日志拆分统计：`找到视频 X 个、照片 Y 个`；总览日志同步显示照片数量
 - 新增 `PHOTO_SUBDIR` 开关：留空与视频混放，设为 `photos` 则归档到 `<日期>/photos/`
