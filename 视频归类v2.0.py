@@ -52,8 +52,13 @@ TARGET_ROOT = r"G:\Osmo action5 pro"
 PATTERN = re.compile(r"^DJI_(\d{8})\d{6}_(\d{4})_[A-Z]")
 # 延时摄影文件夹名正则：001_0004，捕获4位seq
 TL_FOLDER_PATTERN = re.compile(r"^001_(\d{4})$")
-# 大疆视频扩展名白名单，排除 .THM 缩略图 / .LRV 低分辨率预览 / .SRT 字幕 等非视频文件
+# 大疆视频扩展名白名单，排除 .THM 缩略图 / .SRT 字幕 等非视频文件
 VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
+# 照片扩展名：Action5 Pro 拍 JPG，开 RAW 时同时生成同名 DNG
+PHOTO_EXTS = {".jpg", ".jpeg", ".dng"}
+MEDIA_EXTS = VIDEO_EXTS | PHOTO_EXTS
+# 照片单独存放时设成 "photos"（归档到 <日期>/photos/），留空则与视频混放
+PHOTO_SUBDIR = ""
 # 文件拷贝块大小：4MB，分块读写大文件，防止一次性加载整个大视频进内存
 BLOCK_SIZE = 1024 * 1024 * 4
 # ==========================================================================
@@ -269,7 +274,8 @@ class DjiArchiveGui:
             if not os.path.isdir(src_dir):
                 continue
             for fname in os.listdir(src_dir):
-                if os.path.splitext(fname)[1].lower() not in VIDEO_EXTS:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in MEDIA_EXTS:
                     continue
                 m = PATTERN.match(fname)
                 if not m:
@@ -280,6 +286,8 @@ class DjiArchiveGui:
                 mm = date_str[4:6]
                 dd = date_str[6:8]
                 dest_dir = os.path.join(TARGET_ROOT, yyyy, mm, dd)
+                if ext in PHOTO_EXTS and PHOTO_SUBDIR:
+                    dest_dir = os.path.join(dest_dir, PHOTO_SUBDIR)
                 src_f = os.path.join(src_dir, fname)
                 dest_f = os.path.join(dest_dir, fname)
                 flist.append((src_f, dest_f, dest_dir, fname, seq_no))
@@ -365,7 +373,7 @@ class DjiArchiveGui:
         self.msg_queue.put(("stat", total, self.copy_count, self.skip_count, self.total_bytes))
         self.msg_queue.put(("status", "归档进行中"))
         self.msg_queue.put(("log", f"共发现 {total} 个媒体文件。"))
-        self.msg_queue.put(("log", "===== 阶段1：开始复制视频文件 =====\n"))
+        self.msg_queue.put(("log", "===== 阶段1：开始复制媒体文件 =====\n"))
         seq_to_destdir = {}
 
         # --------------------------

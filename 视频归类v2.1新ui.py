@@ -46,6 +46,11 @@ TARGET_ROOT = r"G:\Osmo action5 pro"
 PATTERN = re.compile(r"^DJI_(\d{8})\d{6}_(\d{4})_[A-Z]")
 TL_FOLDER_PATTERN = re.compile(r"^001_(\d{4})$")
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".lrf"}
+# 照片扩展名：Action5 Pro 拍 JPG，开 RAW 时同时生成同名 DNG
+PHOTO_EXTS = {".jpg", ".jpeg", ".dng"}
+MEDIA_EXTS = VIDEO_EXTS | PHOTO_EXTS
+# 照片单独存放时设成 "photos"（归档到 <日期>/photos/），留空则与视频混放
+PHOTO_SUBDIR = ""
 BLOCK_SIZE = 1024 * 1024 * 4
 NAME_MAX_LEN = 70
 
@@ -99,7 +104,7 @@ class DjiArchiveGui(ctk.CTk):
             font=ctk.CTkFont(size=22, weight="bold"),
         ).pack(side=ctk.LEFT)
         ctk.CTkLabel(
-            top_bar, text="自动归档 · 分块拷贝 · 延时摄影支持",
+            top_bar, text="自动归档 · 视频与照片 · 延时摄影支持",
             font=ctk.CTkFont(size=12), text_color="gray",
         ).pack(side=ctk.LEFT, padx=(10, 0), pady=(6, 0))
 
@@ -316,7 +321,8 @@ class DjiArchiveGui(ctk.CTk):
                 continue
             self.msg_queue.put(("log", f"  扫描源目录：{src_dir}"))
             try:
-                dir_count = 0
+                video_count = 0
+                photo_count = 0
                 with os.scandir(src_dir) as entries:
                     for entry in entries:
                         try:
@@ -325,7 +331,8 @@ class DjiArchiveGui(ctk.CTk):
                         except OSError:
                             continue
                         fname = entry.name
-                        if os.path.splitext(fname)[1].lower() not in VIDEO_EXTS:
+                        ext = os.path.splitext(fname)[1].lower()
+                        if ext not in MEDIA_EXTS:
                             continue
                         m = PATTERN.match(fname)
                         if not m:
@@ -335,6 +342,12 @@ class DjiArchiveGui(ctk.CTk):
                         dest_dir = os.path.join(
                             TARGET_ROOT, date_str[0:4], date_str[4:6], date_str[6:8]
                         )
+                        if ext in PHOTO_EXTS:
+                            if PHOTO_SUBDIR:
+                                dest_dir = os.path.join(dest_dir, PHOTO_SUBDIR)
+                            photo_count += 1
+                        else:
+                            video_count += 1
                         flist.append((
                             entry.path,
                             os.path.join(dest_dir, fname),
@@ -343,8 +356,9 @@ class DjiArchiveGui(ctk.CTk):
                             seq_no,
                             date_str,
                         ))
-                        dir_count += 1
-                self.msg_queue.put(("log", f"    → 找到 {dir_count} 个视频文件"))
+                self.msg_queue.put(
+                    ("log", f"    → 找到视频 {video_count} 个、照片 {photo_count} 个")
+                )
             except OSError as e:
                 self.msg_queue.put(("log", f"❌ 无法读取源目录 {src_dir}：{e}"))
         return flist
@@ -514,11 +528,11 @@ class DjiArchiveGui(ctk.CTk):
 
         return copied, skipped, bytes_copied, failed
 
-    def _copy_videos(self, video_list, total_files, total_units):
+    def _copy_videos(self, media_list, total_files, total_units):
         seq_to_destdirs = {}
         completed_units = 0
 
-        for src_file, dest_file, dest_dir, filename, seq_no, date_str in video_list:
+        for src_file, dest_file, dest_dir, filename, seq_no, date_str in media_list:
             if self._cancel_event.is_set():
                 self.msg_queue.put(("log", "\n⚠ 用户取消，停止处理。"))
                 return completed_units, {}
@@ -626,10 +640,10 @@ class DjiArchiveGui(ctk.CTk):
         self.msg_queue.put(("totalbar", 1, 0, 0.0))
         self.msg_queue.put(("log", "开始扫描媒体文件..."))
 
-        video_list = self.scan_files()
+        media_list = self.scan_files()
         tl_folders = self.scan_timelapse_folders()
-        total_files = len(video_list) + sum(len(item[3]) for item in tl_folders)
-        total_units = len(video_list) + len(tl_folders)
+        total_files = len(media_list) + sum(len(item[3]) for item in tl_folders)
+        total_units = len(media_list) + len(tl_folders)
         self.scanned_total = total_files
 
         if total_units == 0:
@@ -645,13 +659,21 @@ class DjiArchiveGui(ctk.CTk):
         self.msg_queue.put(("stat", total_files, 0, 0, 0))
         self.msg_queue.put(("status", "归档进行中"))
         self.msg_queue.put(("totalbar", total_units, 0, 0.0))
+        photo_total = sum(
+            1 for item in media_list if os.path.splitext(item[3])[1].lower() in PHOTO_EXTS
+        )
         self.msg_queue.put((
             "log",
-            f"共发现视频 {len(video_list)} 个、延时摄影文件夹 {len(tl_folders)} 个、文件 {total_files} 个。",
+            (
+                f"共发现视频 {len(media_list) - photo_total} 个、照片 {photo_total} 个、"
+                f"延时摄影文件夹 {len(tl_folders)} 个、文件 {total_files} 个。"
+            ),
         ))
 
-        self.msg_queue.put(("log", "===== 阶段1：开始复制视频文件 =====\n"))
-        completed_units, seq_to_destdirs = self._copy_videos(video_list, total_files, total_units)
+        self.msg_queue.put(("log", "===== 阶段1：开始复制媒体文件 =====\n"))
+        completed_units, seq_to_destdirs = self._copy_videos(
+            media_list, total_files, total_units
+        )
 
         if self._cancel_event.is_set():
             return total_files
